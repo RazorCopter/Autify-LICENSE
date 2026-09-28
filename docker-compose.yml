@@ -1,0 +1,26 @@
+services:
+  autify-license-server:
+    build:
+      context: ./license_server
+    pull_policy: build
+    ports:
+      - "${LICENSE_BIND_ADDRESS:-127.0.0.1}:${LICENSE_PORT:-8001}:8001"
+    environment:
+      - LICENSE_SHARED_SECRET=${LICENSE_SHARED_SECRET}
+      - LICENSE_ADMIN_KEY=${LICENSE_ADMIN_KEY}
+      - LICENSE_REQUEST_FRESHNESS_SECONDS=${LICENSE_REQUEST_FRESHNESS_SECONDS:-120}
+      - LICENSE_ACTIVATE_RATE_LIMIT=${LICENSE_ACTIVATE_RATE_LIMIT:-10/minute}
+      - LICENSE_VALIDATE_RATE_LIMIT=${LICENSE_VALIDATE_RATE_LIMIT:-60/minute}
+      - LICENSE_DB_PATH=/data/licenses.db
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8001/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    volumes:
+      - autify_license_data:/data
+    restart: unless-stopped
+
+volumes:
+  autify_license_data:
