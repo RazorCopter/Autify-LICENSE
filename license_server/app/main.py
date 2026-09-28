@@ -4,11 +4,13 @@ import secrets
 import sqlite3
 import string
 import calendar
+import threading
 from contextlib import asynccontextmanager, contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response, status
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -17,8 +19,13 @@ from slowapi.util import get_remote_address
 from .crypto import decrypt_payload, encrypt_payload
 
 DB_PATH = Path(os.getenv("LICENSE_DB_PATH", "/data/licenses.db"))
+STATIC_PATH = Path(__file__).resolve().parent / "static"
 VALID_PLANS = {"1M": 1, "6M": 6, "12M": 12, "LIFE": None}
+ADMIN_SESSION_COOKIE = "autify_license_admin_session"
 limiter = Limiter(key_func=get_remote_address)
+ADMIN_SESSIONS: dict[str, datetime] = {}
+ADMIN_LOGIN_ATTEMPTS: dict[str, list[datetime]] = {}
+ADMIN_STATE_LOCK = threading.Lock()
 
 @contextmanager
 def db():
@@ -75,6 +82,7 @@ async def lifespan(_app: FastAPI):
 app = FastAPI(title="Autify License Server", version="1.0.0", lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.mount("/admin", StaticFiles(directory=STATIC_PATH, html=True), name="admin")
 
 
 class Envelope(BaseModel):
@@ -92,10 +100,79 @@ class CodeRequest(BaseModel):
     code: str
 
 
-def require_admin(x_license_admin_key: str = Header(default="")) -> None:
+class AdminLoginRequest(BaseModel):
+    admin_key: str = Field(min_length=1, max_length=1000)
+
+
+def admin_key_is_valid(candidate: str) -> bool:
     configured = os.getenv("LICENSE_ADMIN_KEY", "")
-    if len(configured) < 24 or not secrets.compare_digest(x_license_admin_key, configured):
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Chiave amministrativa non valida")
+    return len(configured) >= 24 and bool(candidate) and secrets.compare_digest(candidate, configured)
+
+
+def session_digest(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def session_expiry() -> datetime:
+    try:
+        hours = int(os.getenv("LICENSE_ADMIN_SESSION_HOURS", "8"))
+    except ValueError:
+        hours = 8
+    return datetime.now(timezone.utc) + timedelta(hours=max(1, min(hours, 168)))
+
+
+def create_admin_session() -> tuple[str, datetime]:
+    token = secrets.token_urlsafe(48)
+    expires_at = session_expiry()
+    now = datetime.now(timezone.utc)
+    with ADMIN_STATE_LOCK:
+        expired = [digest for digest, expiry in ADMIN_SESSIONS.items() if expiry <= now]
+        for digest in expired:
+            ADMIN_SESSIONS.pop(digest, None)
+        ADMIN_SESSIONS[session_digest(token)] = expires_at
+    return token, expires_at
+
+
+def admin_session_is_valid(token: str) -> bool:
+    if not token:
+        return False
+    digest = session_digest(token)
+    now = datetime.now(timezone.utc)
+    with ADMIN_STATE_LOCK:
+        expires_at = ADMIN_SESSIONS.get(digest)
+        if expires_at is None:
+            return False
+        if expires_at <= now:
+            ADMIN_SESSIONS.pop(digest, None)
+            return False
+    return True
+
+
+def register_admin_login_attempt(client_address: str) -> None:
+    now = datetime.now(timezone.utc)
+    window_start = now - timedelta(minutes=15)
+    with ADMIN_STATE_LOCK:
+        attempts = [attempt for attempt in ADMIN_LOGIN_ATTEMPTS.get(client_address, []) if attempt > window_start]
+        if len(attempts) >= 10:
+            raise HTTPException(
+                status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+                detail="Troppi tentativi di accesso. Riprova tra alcuni minuti",
+            )
+        attempts.append(now)
+        ADMIN_LOGIN_ATTEMPTS[client_address] = attempts
+
+
+def clear_admin_login_attempts(client_address: str) -> None:
+    with ADMIN_STATE_LOCK:
+        ADMIN_LOGIN_ATTEMPTS.pop(client_address, None)
+
+
+def require_admin(request: Request, x_license_admin_key: str = Header(default="")) -> None:
+    if admin_key_is_valid(x_license_admin_key):
+        return
+    if admin_session_is_valid(request.cookies.get(ADMIN_SESSION_COOKIE, "")):
+        return
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Autenticazione amministrativa richiesta")
 
 
 def code_hash(code: str) -> str:
@@ -154,9 +231,111 @@ def public_license(row: sqlite3.Row, now: datetime) -> dict:
     }
 
 
+def admin_license(row: sqlite3.Row, now: datetime) -> dict:
+    public = public_license(row, now)
+    return {
+        "code_suffix": row["code_suffix"],
+        "plan": row["plan"],
+        "customer": row["customer"],
+        "created_at": row["created_at"],
+        "activated_at": row["activated_at"],
+        "expires_at": row["expires_at"],
+        "instance_id": row["instance_id"],
+        "revoked_at": row["revoked_at"],
+        "status": public["reason"],
+    }
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
+
+
+@app.post("/v1/admin/session")
+def login_admin(payload: AdminLoginRequest, request: Request, response: Response) -> dict:
+    client_address = request.client.host if request.client else "unknown"
+    register_admin_login_attempt(client_address)
+    if not admin_key_is_valid(payload.admin_key):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Chiave amministrativa non valida")
+    clear_admin_login_attempts(client_address)
+    token, expires_at = create_admin_session()
+    response.set_cookie(
+        key=ADMIN_SESSION_COOKIE,
+        value=token,
+        expires=expires_at,
+        httponly=True,
+        secure=os.getenv("LICENSE_ADMIN_COOKIE_SECURE", "true").lower() not in {"0", "false", "no"},
+        samesite="strict",
+        path="/",
+    )
+    return {"authenticated": True, "expires_at": expires_at.isoformat()}
+
+
+@app.get("/v1/admin/session", dependencies=[Depends(require_admin)])
+def get_admin_session() -> dict:
+    return {"authenticated": True}
+
+
+@app.delete("/v1/admin/session")
+def logout_admin(request: Request, response: Response) -> dict:
+    token = request.cookies.get(ADMIN_SESSION_COOKIE, "")
+    if token:
+        with ADMIN_STATE_LOCK:
+            ADMIN_SESSIONS.pop(session_digest(token), None)
+    response.delete_cookie(key=ADMIN_SESSION_COOKIE, path="/", samesite="strict")
+    return {"authenticated": False}
+
+
+@app.get("/v1/admin/licenses", dependencies=[Depends(require_admin)])
+def list_licenses(
+    license_status: str | None = Query(default=None, alias="status", pattern="^(not_activated|active|expired|revoked)$"),
+    plan: str | None = Query(default=None, pattern="^(1M|6M|12M|LIFE)$"),
+    customer: str | None = Query(default=None, max_length=200),
+) -> dict:
+    now = datetime.now(timezone.utc)
+    clauses = []
+    parameters: list[str] = []
+    if plan:
+        clauses.append("plan = ?")
+        parameters.append(plan)
+    if customer:
+        clauses.append("customer LIKE ?")
+        parameters.append(f"%{customer.strip()}%")
+    query = "SELECT * FROM licenses"
+    if clauses:
+        query += " WHERE " + " AND ".join(clauses)
+    query += " ORDER BY created_at DESC, code_suffix ASC"
+    with db() as connection:
+        licenses = [admin_license(row, now) for row in connection.execute(query, parameters).fetchall()]
+    if license_status:
+        licenses = [license for license in licenses if license["status"] == license_status]
+    return {"licenses": licenses, "total": len(licenses)}
+
+
+@app.get("/v1/admin/licenses/{code_suffix}", dependencies=[Depends(require_admin)])
+def get_license(code_suffix: str) -> dict:
+    normalized_suffix = code_suffix.strip().upper()
+    if len(normalized_suffix) != 6 or any(character not in string.ascii_uppercase + string.digits for character in normalized_suffix):
+        raise HTTPException(status_code=400, detail="Suffisso licenza non valido")
+    with db() as connection:
+        rows = connection.execute("SELECT * FROM licenses WHERE code_suffix = ?", (normalized_suffix,)).fetchall()
+    if not rows:
+        raise HTTPException(status_code=404, detail="Licenza non trovata")
+    if len(rows) > 1:
+        raise HTTPException(status_code=409, detail="Suffisso ambiguo")
+    return admin_license(rows[0], datetime.now(timezone.utc))
+
+
+@app.get("/v1/admin/stats", dependencies=[Depends(require_admin)])
+def license_stats() -> dict:
+    now = datetime.now(timezone.utc)
+    counts = {"total": 0, "not_activated": 0, "active": 0, "expired": 0, "revoked": 0}
+    with db() as connection:
+        rows = connection.execute("SELECT * FROM licenses").fetchall()
+    for row in rows:
+        counts["total"] += 1
+        counts[public_license(row, now)["reason"]] += 1
+    return counts
 
 
 @app.post("/v1/admin/licenses", dependencies=[Depends(require_admin)])
@@ -186,6 +365,22 @@ def revoke_license(payload: CodeRequest) -> dict:
     return {"status": "revoked"}
 
 
+@app.post("/v1/admin/licenses/{code_suffix}/revoke", dependencies=[Depends(require_admin)])
+def revoke_license_by_suffix(code_suffix: str) -> dict:
+    normalized_suffix = code_suffix.strip().upper()
+    with db() as connection:
+        rows = connection.execute("SELECT code_hash FROM licenses WHERE code_suffix = ?", (normalized_suffix,)).fetchall()
+        if not rows:
+            raise HTTPException(status_code=404, detail="Licenza non trovata")
+        if len(rows) > 1:
+            raise HTTPException(status_code=409, detail="Suffisso ambiguo")
+        connection.execute(
+            "UPDATE licenses SET revoked_at = ? WHERE code_hash = ?",
+            (datetime.now(timezone.utc).isoformat(), rows[0]["code_hash"]),
+        )
+    return {"status": "revoked"}
+
+
 @app.post("/v1/admin/licenses/release", dependencies=[Depends(require_admin)])
 def release_license(payload: CodeRequest) -> dict:
     code = normalize_code(payload.code)
@@ -196,6 +391,23 @@ def release_license(payload: CodeRequest) -> dict:
         )
         if result.rowcount == 0:
             raise HTTPException(status_code=404, detail="Licenza non trovata")
+    return {"status": "released"}
+
+
+@app.post("/v1/admin/licenses/{code_suffix}/release", dependencies=[Depends(require_admin)])
+def release_license_by_suffix(code_suffix: str) -> dict:
+    normalized_suffix = code_suffix.strip().upper()
+    with db() as connection:
+        rows = connection.execute("SELECT code_hash FROM licenses WHERE code_suffix = ?", (normalized_suffix,)).fetchall()
+        if not rows:
+            raise HTTPException(status_code=404, detail="Licenza non trovata")
+        if len(rows) > 1:
+            raise HTTPException(status_code=409, detail="Suffisso ambiguo")
+        connection.execute(
+            "UPDATE licenses SET instance_id = NULL, activated_at = NULL, expires_at = NULL, "
+            "revoked_at = NULL, token_hash = NULL WHERE code_hash = ?",
+            (rows[0]["code_hash"],),
+        )
     return {"status": "released"}
 
 

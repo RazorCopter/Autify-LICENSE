@@ -138,3 +138,70 @@ def test_lifetime_has_no_expiry(tmp_path):
         payload = decrypt_payload(activated.json(), validate_freshness=False)
         assert payload["valid"] is True
         assert payload["expires_at"] is None
+
+
+def test_admin_dashboard_session_listing_stats_and_actions(tmp_path, monkeypatch):
+    main.DB_PATH = tmp_path / "admin-dashboard.db"
+    main.ADMIN_SESSIONS.clear()
+    main.ADMIN_LOGIN_ATTEMPTS.clear()
+    monkeypatch.setenv("LICENSE_ADMIN_COOKIE_SECURE", "false")
+
+    with TestClient(main.app) as client:
+        dashboard = client.get("/admin/")
+        assert dashboard.status_code == 200
+        assert "Gestione licenze" in dashboard.text
+
+        assert client.get("/v1/admin/licenses").status_code == 401
+        invalid_login = client.post("/v1/admin/session", json={"admin_key": "wrong-key"})
+        assert invalid_login.status_code == 401
+
+        login = client.post(
+            "/v1/admin/session",
+            json={"admin_key": os.environ["LICENSE_ADMIN_KEY"]},
+        )
+        assert login.status_code == 200
+        assert login.json()["authenticated"] is True
+        assert login.cookies.get(main.ADMIN_SESSION_COOKIE)
+
+        generated = client.post(
+            "/v1/admin/licenses",
+            json={"plan": "6M", "customer": "Azienda Demo", "quantity": 1},
+        )
+        assert generated.status_code == 200
+        code = generated.json()["codes"][0]
+        suffix = code[-6:]
+
+        listed = client.get("/v1/admin/licenses", params={"customer": "Demo", "plan": "6M"})
+        assert listed.status_code == 200
+        assert listed.json()["total"] == 1
+        assert listed.json()["licenses"][0] == {
+            "code_suffix": suffix,
+            "plan": "6M",
+            "customer": "Azienda Demo",
+            "created_at": listed.json()["licenses"][0]["created_at"],
+            "activated_at": None,
+            "expires_at": None,
+            "instance_id": None,
+            "revoked_at": None,
+            "status": "not_activated",
+        }
+        assert client.get(f"/v1/admin/licenses/{suffix}").status_code == 200
+        assert client.get("/v1/admin/stats").json() == {
+            "total": 1,
+            "not_activated": 1,
+            "active": 0,
+            "expired": 0,
+            "revoked": 0,
+        }
+
+        revoked = client.post(f"/v1/admin/licenses/{suffix}/revoke")
+        assert revoked.status_code == 200
+        assert client.get("/v1/admin/stats").json()["revoked"] == 1
+
+        released = client.post(f"/v1/admin/licenses/{suffix}/release")
+        assert released.status_code == 200
+        assert client.get(f"/v1/admin/licenses/{suffix}").json()["status"] == "not_activated"
+
+        logout = client.delete("/v1/admin/session")
+        assert logout.status_code == 200
+        assert client.get("/v1/admin/stats").status_code == 401

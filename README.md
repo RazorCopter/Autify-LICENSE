@@ -27,7 +27,9 @@ Autify cliente (autify-api) -- HTTPS --> licenze.ghome.it
 3. Assegnare il primo a `LICENSE_SHARED_SECRET` e il secondo a `LICENSE_ADMIN_KEY`.
 4. Configurare lo stesso `LICENSE_SHARED_SECRET` negli stack Autify cliente.
 
-`LICENSE_ADMIN_KEY` deve rimanere esclusivamente su questo server e serve per creare o revocare licenze.
+`LICENSE_ADMIN_KEY` deve rimanere esclusivamente su questo server e serve per creare o revocare licenze. La dashboard la invia al server solo durante il login e riceve un cookie di sessione `HttpOnly`; la chiave non viene memorizzata nel browser.
+
+Le sessioni amministrative durano 8 ore per impostazione predefinita. La durata puo' essere configurata con `LICENSE_ADMIN_SESSION_HOURS` (da 1 a 168 ore). `LICENSE_ADMIN_COOKIE_SECURE` deve restare `true` quando il servizio e' pubblicato in HTTPS; puo' essere impostato a `false` esclusivamente durante test locali in HTTP.
 
 ## Avvio
 
@@ -38,6 +40,28 @@ curl http://127.0.0.1:8001/health
 ```
 
 Il bind predefinito e' `127.0.0.1:8001`: pubblicare il servizio con nginx, Traefik o un altro reverse proxy dotato di certificato TLS valido per `licenze.ghome.it`. Se il reverse proxy gira in un altro container, impostare un indirizzo o una rete Docker compatibile con quella configurazione.
+
+## Dashboard amministrativa
+
+La dashboard e' disponibile sullo stesso servizio:
+
+```text
+https://licenze.ghome.it/admin/
+```
+
+Consente di:
+
+- consultare i contatori e l'elenco delle licenze;
+- filtrare per azienda, piano e stato;
+- generare licenze da 1, 6 o 12 mesi oppure a vita;
+- copiare i codici appena generati;
+- revocare o rilasciare una licenza.
+
+Il codice completo di una licenza viene conservato soltanto come hash e non puo' essere recuperato successivamente: copiarlo dalla schermata subito dopo la generazione. Nell'elenco viene mostrato esclusivamente il suffisso di sei caratteri.
+
+Le sessioni della dashboard sono conservate in memoria. Un riavvio del container disconnette gli amministratori senza influire sulle licenze. E' comunque raccomandato proteggere `/admin/` con Cloudflare Access, VPN o un controllo equivalente a livello di reverse proxy.
+
+Gli endpoint amministrativi continuano ad accettare l'header `X-License-Admin-Key` per automazioni e integrazioni server-to-server.
 
 ## Portainer Git stack
 
