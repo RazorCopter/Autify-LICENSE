@@ -348,6 +348,9 @@ def test_admin_dashboard_session_listing_stats_and_actions(tmp_path, monkeypatch
         dashboard = client.get("/admin/")
         assert dashboard.status_code == 200
         assert "Gestione licenze" in dashboard.text
+        assert "app-version" in dashboard.text
+        assert client.get("/health").json() == {"status": "ok", "version": "1.2.0"}
+        assert client.get("/openapi.json").json()["info"]["version"] == "1.2.0"
 
         assert client.get("/v1/admin/licenses").status_code == 401
         invalid_login = client.post("/v1/admin/session", json={"admin_key": "wrong-key"})

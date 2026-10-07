@@ -21,6 +21,7 @@ from .crypto import decrypt_license_code, decrypt_payload, encrypt_license_code,
 DB_PATH = Path(os.getenv("LICENSE_DB_PATH", "/data/licenses.db"))
 STATIC_PATH = Path(__file__).resolve().parent / "static"
 VALID_PLANS = {"1M": 1, "6M": 6, "12M": 12, "LIFE": None}
+APP_VERSION = "1.2.0"
 ADMIN_SESSION_COOKIE = "autify_license_admin_session"
 limiter = Limiter(key_func=get_remote_address)
 ADMIN_SESSIONS: dict[str, datetime] = {}
@@ -82,7 +83,7 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="Autify License Server", version="1.2.0", lifespan=lifespan)
+app = FastAPI(title="Autify License Server", version=APP_VERSION, lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.mount("/admin", StaticFiles(directory=STATIC_PATH, html=True), name="admin")
@@ -264,7 +265,7 @@ def license_by_suffix(connection: sqlite3.Connection, code_suffix: str) -> sqlit
 
 @app.get("/health")
 def health() -> dict:
-    return {"status": "ok"}
+    return {"status": "ok", "version": APP_VERSION}
 
 
 @app.post("/v1/admin/session")

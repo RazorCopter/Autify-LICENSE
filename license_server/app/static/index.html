@@ -29,6 +29,8 @@
     .login-card { width: min(430px, 100%); padding: 36px; border: 1px solid var(--border); border-radius: 22px; background: var(--surface); box-shadow: var(--shadow); }
     .brand { display: flex; align-items: center; gap: 12px; font-size: 22px; font-weight: 750; }
     .logo { display: grid; place-items: center; width: 42px; height: 42px; border-radius: 12px; color: #fff; background: linear-gradient(135deg, var(--primary), #42a5f5); }
+    .brand-copy { display: flex; align-items: center; gap: 9px; }
+    .version { display: inline-flex; align-items: center; padding: 3px 8px; border: 1px solid #bfdbfe; border-radius: 999px; color: var(--primary-dark); background: #eff6ff; font-size: 12px; font-weight: 750; line-height: 1.2; }
     h1 { margin: 22px 0 8px; font-size: 28px; }
     h2 { margin: 0; font-size: 21px; }
     p { color: var(--muted); }
@@ -81,13 +83,13 @@
     .empty { padding: 28px; text-align: center; color: var(--muted); }
     .toast { position: fixed; right: 22px; bottom: 22px; z-index: 10; max-width: 390px; padding: 13px 17px; border-radius: 10px; color: #fff; background: #172033; box-shadow: var(--shadow); }
     @media (max-width: 900px) { .stats { grid-template-columns: repeat(2, 1fr); } .grid, .filters { grid-template-columns: 1fr 1fr; } }
-    @media (max-width: 560px) { main { width: min(100% - 24px, 1280px); margin-top: 18px; } header { padding: 12px; } .brand span:last-child { display: none; } .headline { align-items: start; flex-direction: column; } .stats, .grid, .filters { grid-template-columns: 1fr; } .panel { padding: 16px; } }
+    @media (max-width: 560px) { main { width: min(100% - 24px, 1280px); margin-top: 18px; } header { padding: 12px; } .brand-copy > span:first-child { display: none; } .headline { align-items: start; flex-direction: column; } .stats, .grid, .filters { grid-template-columns: 1fr; } .panel { padding: 16px; } }
   </style>
 </head>
 <body>
   <section id="login" class="login">
     <form id="loginForm" class="login-card">
-      <div class="brand"><span class="logo">A</span><span>Autify License</span></div>
+      <div class="brand"><span class="logo">A</span><span class="brand-copy"><span>Autify License</span><span class="version app-version">v…</span></span></div>
       <h1>Area amministrativa</h1>
       <p>Inserisci la chiave amministrativa. La chiave viene inviata al server una sola volta e non viene salvata nel browser.</p>
       <div class="field"><label for="adminKey">Chiave amministrativa</label><input id="adminKey" name="adminKey" type="password" autocomplete="current-password" required autofocus></div>
@@ -97,7 +99,7 @@
   </section>
 
   <div id="app" class="hidden">
-    <header><div class="brand"><span class="logo">A</span><span>Gestione licenze</span></div><button id="logout" class="btn secondary">Esci</button></header>
+    <header><div class="brand"><span class="logo">A</span><span class="brand-copy"><span>Gestione licenze</span><span class="version app-version">v…</span></span></div><button id="logout" class="btn secondary">Esci</button></header>
     <main>
       <div class="headline"><div><h1>Licenze Autify</h1><p>Crea, consulta e gestisci le licenze dei clienti.</p></div><button id="refresh" class="btn secondary">Aggiorna</button></div>
       <section class="stats" aria-label="Statistiche">
@@ -150,6 +152,17 @@
       const body = await response.json().catch(() => ({}));
       if (!response.ok) throw new Error(body.detail || `Errore HTTP ${response.status}`);
       return body;
+    }
+
+    async function loadVersion() {
+      try {
+        const response = await fetch("/health", { cache: "no-store" });
+        if (!response.ok) throw new Error();
+        const health = await response.json();
+        document.querySelectorAll(".app-version").forEach((element) => { element.textContent = `v${health.version || "?"}`; });
+      } catch {
+        document.querySelectorAll(".app-version").forEach((element) => { element.textContent = "v?"; });
+      }
     }
 
     function showLogin(message = "") { revealedCodes.clear(); currentLicenses = []; $("app").classList.add("hidden"); $("login").classList.remove("hidden"); $("loginError").textContent = message; }
@@ -240,7 +253,8 @@
     $("refresh").addEventListener("click", async () => { try { await refresh(); toast("Dati aggiornati"); } catch (error) { toast(error.message); } });
     $("logout").addEventListener("click", async () => { await api("/v1/admin/session", { method: "DELETE" }).catch(() => {}); showLogin(); });
 
-    (async () => { try { await api("/v1/admin/session"); showApp(); await refresh(); } catch (_) { showLogin(); } })();
+    loadVersion();
+    (async () => { try { await api("/v1/admin/session"); showApp(); await refresh(); } catch { showLogin(); } })();
   </script>
 </body>
 </html>
