@@ -16,7 +16,7 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 
-from .crypto import decrypt_payload, encrypt_payload
+from .crypto import decrypt_license_code, decrypt_payload, encrypt_license_code, encrypt_payload
 
 DB_PATH = Path(os.getenv("LICENSE_DB_PATH", "/data/licenses.db"))
 STATIC_PATH = Path(__file__).resolve().parent / "static"
@@ -52,7 +52,8 @@ def initialize_database() -> None:
                 activated_at TEXT,
                 expires_at TEXT,
                 instance_id TEXT,
-                revoked_at TEXT
+                revoked_at TEXT,
+                encrypted_code TEXT
             );
             CREATE TABLE IF NOT EXISTS request_nonces (
                 nonce TEXT PRIMARY KEY,
@@ -64,6 +65,8 @@ def initialize_database() -> None:
         columns = {row["name"] for row in connection.execute("PRAGMA table_info(licenses)")}
         if "token_hash" not in columns:
             connection.execute("ALTER TABLE licenses ADD COLUMN token_hash TEXT")
+        if "encrypted_code" not in columns:
+            connection.execute("ALTER TABLE licenses ADD COLUMN encrypted_code TEXT")
         connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_license_token ON licenses(token_hash)")
 
 
@@ -79,7 +82,7 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="Autify License Server", version="1.1.0", lifespan=lifespan)
+app = FastAPI(title="Autify License Server", version="1.2.0", lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.mount("/admin", StaticFiles(directory=STATIC_PATH, html=True), name="admin")
@@ -243,7 +246,20 @@ def admin_license(row: sqlite3.Row, now: datetime) -> dict:
         "instance_id": row["instance_id"],
         "revoked_at": row["revoked_at"],
         "status": public["reason"],
+        "code_available": row["encrypted_code"] is not None,
     }
+
+
+def license_by_suffix(connection: sqlite3.Connection, code_suffix: str) -> sqlite3.Row:
+    normalized_suffix = code_suffix.strip().upper()
+    if len(normalized_suffix) != 6 or any(character not in string.ascii_uppercase + string.digits for character in normalized_suffix):
+        raise HTTPException(status_code=400, detail="Suffisso licenza non valido")
+    rows = connection.execute("SELECT * FROM licenses WHERE code_suffix = ?", (normalized_suffix,)).fetchall()
+    if not rows:
+        raise HTTPException(status_code=404, detail="Licenza non trovata")
+    if len(rows) > 1:
+        raise HTTPException(status_code=409, detail="Suffisso ambiguo")
+    return rows[0]
 
 
 @app.get("/health")
@@ -314,16 +330,24 @@ def list_licenses(
 
 @app.get("/v1/admin/licenses/{code_suffix}", dependencies=[Depends(require_admin)])
 def get_license(code_suffix: str) -> dict:
-    normalized_suffix = code_suffix.strip().upper()
-    if len(normalized_suffix) != 6 or any(character not in string.ascii_uppercase + string.digits for character in normalized_suffix):
-        raise HTTPException(status_code=400, detail="Suffisso licenza non valido")
     with db() as connection:
-        rows = connection.execute("SELECT * FROM licenses WHERE code_suffix = ?", (normalized_suffix,)).fetchall()
-    if not rows:
-        raise HTTPException(status_code=404, detail="Licenza non trovata")
-    if len(rows) > 1:
-        raise HTTPException(status_code=409, detail="Suffisso ambiguo")
-    return admin_license(rows[0], datetime.now(timezone.utc))
+        row = license_by_suffix(connection, code_suffix)
+        return admin_license(row, datetime.now(timezone.utc))
+
+
+@app.get("/v1/admin/licenses/{code_suffix}/code", dependencies=[Depends(require_admin)])
+def reveal_license_code(code_suffix: str) -> dict:
+    with db() as connection:
+        row = license_by_suffix(connection, code_suffix)
+    if row["encrypted_code"] is None:
+        raise HTTPException(status_code=404, detail="Codice licenza non disponibile")
+    try:
+        code = decrypt_license_code(row["encrypted_code"], row["code_hash"])
+    except ValueError as exc:
+        raise HTTPException(status_code=500, detail="Codice licenza non recuperabile") from exc
+    if not secrets.compare_digest(code_hash(code), row["code_hash"]):
+        raise HTTPException(status_code=500, detail="Codice licenza non recuperabile")
+    return {"code": code}
 
 
 @app.get("/v1/admin/stats", dependencies=[Depends(require_admin)])
@@ -345,9 +369,11 @@ def create_licenses(payload: GenerateRequest) -> dict:
     with db() as connection:
         for _ in range(payload.quantity):
             code = generate_code(payload.plan)
+            hashed_code = code_hash(code)
             connection.execute(
-                "INSERT INTO licenses(code_hash, code_suffix, plan, customer, created_at) VALUES (?, ?, ?, ?, ?)",
-                (code_hash(code), code[-6:], payload.plan, payload.customer, now),
+                "INSERT INTO licenses(code_hash, code_suffix, plan, customer, created_at, encrypted_code) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (hashed_code, code[-6:], payload.plan, payload.customer, now, encrypt_license_code(code, hashed_code)),
             )
             generated.append(code)
     return {"codes": generated, "plan": payload.plan}
@@ -409,6 +435,19 @@ def release_license_by_suffix(code_suffix: str) -> dict:
             (rows[0]["code_hash"],),
         )
     return {"status": "released"}
+
+
+@app.delete("/v1/admin/licenses/{code_suffix}", dependencies=[Depends(require_admin)])
+def delete_license(code_suffix: str, force: bool = Query(default=False)) -> dict:
+    with db() as connection:
+        row = license_by_suffix(connection, code_suffix)
+        if public_license(row, datetime.now(timezone.utc))["reason"] == "active" and not force:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail="La licenza e' attiva: ripetere la richiesta con force=true per eliminarla",
+            )
+        connection.execute("DELETE FROM licenses WHERE code_hash = ?", (row["code_hash"],))
+    return {"status": "deleted"}
 
 
 @app.post("/v1/activate", response_model=Envelope)

@@ -1,5 +1,6 @@
 import os
 import secrets
+import sqlite3
 import time
 from datetime import datetime, timezone
 
@@ -179,6 +180,123 @@ def test_add_months_uses_calendar_months():
     assert main.add_months(datetime(2024, 1, 31, tzinfo=timezone.utc), 1) == datetime(
         2024, 2, 29, tzinfo=timezone.utc
     )
+
+
+def test_admin_can_reveal_new_license_without_exposing_code_in_lists(tmp_path):
+    main.DB_PATH = tmp_path / "licenses.db"
+    headers = {"X-License-Admin-Key": os.environ["LICENSE_ADMIN_KEY"]}
+
+    with TestClient(main.app) as client:
+        generated = client.post(
+            "/v1/admin/licenses",
+            headers=headers,
+            json={"plan": "6M", "quantity": 1, "customer": "Example SpA"},
+        )
+        assert generated.status_code == 200
+        code = generated.json()["codes"][0]
+        suffix = code[-6:]
+
+        listed = client.get("/v1/admin/licenses", headers=headers)
+        assert listed.status_code == 200
+        license_data = listed.json()["licenses"][0]
+        assert license_data["code_available"] is True
+        assert "code" not in license_data
+        assert code not in listed.text
+
+        detail = client.get(f"/v1/admin/licenses/{suffix}", headers=headers)
+        assert detail.status_code == 200
+        assert detail.json()["code_available"] is True
+        assert "code" not in detail.json()
+
+        revealed = client.get(f"/v1/admin/licenses/{suffix}/code", headers=headers)
+        assert revealed.status_code == 200
+        assert revealed.json() == {"code": code}
+
+    with sqlite3.connect(main.DB_PATH) as connection:
+        stored = connection.execute(
+            "SELECT code_hash, encrypted_code FROM licenses WHERE code_suffix = ?", (suffix,)
+        ).fetchone()
+    assert stored[0] == main.code_hash(code)
+    assert stored[1] is not None
+    assert code not in stored[1]
+
+
+def test_code_reveal_requires_admin_authentication(tmp_path):
+    main.DB_PATH = tmp_path / "licenses.db"
+    headers = {"X-License-Admin-Key": os.environ["LICENSE_ADMIN_KEY"]}
+
+    with TestClient(main.app) as client:
+        generated = client.post("/v1/admin/licenses", headers=headers, json={"plan": "1M", "quantity": 1})
+        suffix = generated.json()["codes"][0][-6:]
+        assert client.get(f"/v1/admin/licenses/{suffix}/code").status_code == 401
+
+
+def test_historical_license_code_is_unavailable_after_migration(tmp_path):
+    main.DB_PATH = tmp_path / "licenses.db"
+    headers = {"X-License-Admin-Key": os.environ["LICENSE_ADMIN_KEY"]}
+    code = main.generate_code("LIFE")
+    with sqlite3.connect(main.DB_PATH) as connection:
+        connection.execute(
+            """
+            CREATE TABLE licenses (
+                code_hash TEXT PRIMARY KEY,
+                code_suffix TEXT NOT NULL,
+                plan TEXT NOT NULL,
+                customer TEXT,
+                created_at TEXT NOT NULL,
+                activated_at TEXT,
+                expires_at TEXT,
+                instance_id TEXT,
+                revoked_at TEXT,
+                token_hash TEXT
+            )
+            """
+        )
+        connection.execute(
+            "INSERT INTO licenses(code_hash, code_suffix, plan, customer, created_at) VALUES (?, ?, ?, ?, ?)",
+            (main.code_hash(code), code[-6:], "LIFE", "Storico", datetime.now(timezone.utc).isoformat()),
+        )
+
+    with TestClient(main.app) as client:
+        with sqlite3.connect(main.DB_PATH) as connection:
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(licenses)")}
+        assert "encrypted_code" in columns
+        detail = client.get(f"/v1/admin/licenses/{code[-6:]}", headers=headers)
+        assert detail.status_code == 200
+        assert detail.json()["code_available"] is False
+        unavailable = client.get(f"/v1/admin/licenses/{code[-6:]}/code", headers=headers)
+        assert unavailable.status_code == 404
+        assert unavailable.json()["detail"] == "Codice licenza non disponibile"
+
+
+def test_license_deletion_and_active_force_guard(tmp_path):
+    main.DB_PATH = tmp_path / "licenses.db"
+    main.limiter.reset()
+    headers = {"X-License-Admin-Key": os.environ["LICENSE_ADMIN_KEY"]}
+
+    with TestClient(main.app) as client:
+        generated = client.post("/v1/admin/licenses", headers=headers, json={"plan": "12M", "quantity": 2})
+        first_code, active_code = generated.json()["codes"]
+
+        unauthorized = client.delete(f"/v1/admin/licenses/{first_code[-6:]}")
+        assert unauthorized.status_code == 401
+        deleted = client.delete(f"/v1/admin/licenses/{first_code[-6:]}", headers=headers)
+        assert deleted.status_code == 200
+        assert deleted.json() == {"status": "deleted"}
+        assert client.get(f"/v1/admin/licenses/{first_code[-6:]}", headers=headers).status_code == 404
+
+        activated = client.post(
+            "/v1/activate",
+            json=_request_payload(code=active_code, instance_id="active-delete-instance"),
+        )
+        assert activated.status_code == 200
+        guarded = client.delete(f"/v1/admin/licenses/{active_code[-6:]}", headers=headers)
+        assert guarded.status_code == 409
+        assert client.get(f"/v1/admin/licenses/{active_code[-6:]}", headers=headers).status_code == 200
+
+        forced = client.delete(f"/v1/admin/licenses/{active_code[-6:]}?force=true", headers=headers)
+        assert forced.status_code == 200
+        assert forced.json() == {"status": "deleted"}
     assert main.add_months(datetime(2025, 3, 31, tzinfo=timezone.utc), 1) == datetime(
         2025, 4, 30, tzinfo=timezone.utc
     )
@@ -264,6 +382,7 @@ def test_admin_dashboard_session_listing_stats_and_actions(tmp_path, monkeypatch
             "instance_id": None,
             "revoked_at": None,
             "status": "not_activated",
+            "code_available": True,
         }
         assert client.get(f"/v1/admin/licenses/{suffix}").status_code == 200
         assert client.get("/v1/admin/stats").json() == {

@@ -42,6 +42,7 @@
     .btn.secondary { color: var(--ink); border: 1px solid var(--border); background: #fff; }
     .btn.secondary:hover { background: #f8fafc; }
     .btn.danger { color: var(--danger); border: 1px solid #fecaca; background: #fff5f5; }
+    .btn.danger:hover { background: #fee2e2; }
     .btn.small { padding: 7px 10px; font-size: 13px; }
     .wide { width: 100%; }
     .error { min-height: 21px; color: var(--danger); }
@@ -74,6 +75,9 @@
     .badge.revoked, .badge.expired { color: var(--danger); background: #ffeded; }
     .badge.not_activated { color: var(--warning); background: #fff4df; }
     .actions { display: flex; gap: 7px; }
+    .license-code { display: flex; align-items: center; gap: 8px; min-width: 205px; }
+    .license-code strong { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+    .unavailable { color: var(--muted); font-size: 12px; }
     .empty { padding: 28px; text-align: center; color: var(--muted); }
     .toast { position: fixed; right: 22px; bottom: 22px; z-index: 10; max-width: 390px; padding: 13px 17px; border-radius: 10px; color: #fff; background: #172033; box-shadow: var(--shadow); }
     @media (max-width: 900px) { .stats { grid-template-columns: repeat(2, 1fr); } .grid, .filters { grid-template-columns: 1fr 1fr; } }
@@ -112,7 +116,7 @@
           <div class="field"><label for="quantity">Quantità</label><input id="quantity" type="number" min="1" max="100" value="1" required></div>
           <button class="btn" type="submit">Genera</button>
         </form>
-        <div id="generated" class="generated hidden"><strong>Codici generati (mostrati solo ora)</strong><div id="generatedCodes"></div></div>
+        <div id="generated" class="generated hidden"><strong>Codici generati</strong><div id="generatedCodes"></div></div>
       </section>
 
       <section class="panel">
@@ -133,6 +137,8 @@
     const $ = (id) => document.getElementById(id);
     const statusLabels = { active: "Attiva", not_activated: "Da attivare", expired: "Scaduta", revoked: "Revocata" };
     const planLabels = { "1M": "1 mese", "6M": "6 mesi", "12M": "12 mesi", LIFE: "A vita" };
+    const revealedCodes = new Map();
+    let currentLicenses = [];
 
     function escapeHtml(value) {
       return String(value ?? "").replace(/[&<>'"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[char]));
@@ -146,10 +152,27 @@
       return body;
     }
 
-    function showLogin(message = "") { $("app").classList.add("hidden"); $("login").classList.remove("hidden"); $("loginError").textContent = message; }
+    function showLogin(message = "") { revealedCodes.clear(); currentLicenses = []; $("app").classList.add("hidden"); $("login").classList.remove("hidden"); $("loginError").textContent = message; }
     function showApp() { $("login").classList.add("hidden"); $("app").classList.remove("hidden"); }
     function toast(message) { $("toast").textContent = message; $("toast").classList.remove("hidden"); clearTimeout(window.toastTimer); window.toastTimer = setTimeout(() => $("toast").classList.add("hidden"), 3200); }
     function date(value) { if (!value) return "—"; return new Intl.DateTimeFormat("it-IT", { dateStyle: "medium", timeStyle: "short" }).format(new Date(value)); }
+
+    function renderLicenses() {
+      $("licenseRows").innerHTML = currentLicenses.map((license) => {
+        const code = revealedCodes.get(license.code_suffix);
+        const codeControls = license.code_available
+          ? code
+            ? `<button class="btn secondary small" data-action="hide" data-suffix="${escapeHtml(license.code_suffix)}">Nascondi</button><button class="btn secondary small" data-action="copy-code" data-suffix="${escapeHtml(license.code_suffix)}">Copia</button>`
+            : `<button class="btn secondary small" data-action="reveal" data-suffix="${escapeHtml(license.code_suffix)}">Mostra</button>`
+          : `<span class="unavailable" title="Licenza creata prima dell'archiviazione cifrata dei codici">Non disponibile</span>`;
+        return `<tr>
+          <td><div class="license-code"><strong>${escapeHtml(code || `••••-${license.code_suffix}`)}</strong>${codeControls}</div></td><td>${escapeHtml(license.customer || "—")}</td><td>${escapeHtml(planLabels[license.plan])}</td>
+          <td><span class="badge ${escapeHtml(license.status)}">${escapeHtml(statusLabels[license.status])}</span></td><td>${date(license.created_at)}</td><td>${license.plan === "LIFE" ? "Mai" : date(license.expires_at)}</td>
+          <td title="${escapeHtml(license.instance_id || "")}">${escapeHtml(license.instance_id ? license.instance_id.slice(0, 12) + "…" : "—")}</td>
+          <td><div class="actions">${license.status !== "revoked" ? `<button class="btn danger small" data-action="revoke" data-suffix="${escapeHtml(license.code_suffix)}">Revoca</button>` : ""}${license.status !== "not_activated" ? `<button class="btn secondary small" data-action="release" data-suffix="${escapeHtml(license.code_suffix)}">Rilascia</button>` : ""}<button class="btn danger small" data-action="delete" data-suffix="${escapeHtml(license.code_suffix)}" data-status="${escapeHtml(license.status)}">Elimina</button></div></td>
+        </tr>`;
+      }).join("");
+    }
 
     async function loadStats() {
       const data = await api("/v1/admin/stats");
@@ -162,14 +185,10 @@
       if ($("filterPlan").value) params.set("plan", $("filterPlan").value);
       if ($("filterStatus").value) params.set("status", $("filterStatus").value);
       const data = await api(`/v1/admin/licenses?${params}`);
+      currentLicenses = data.licenses;
       $("resultCount").textContent = `${data.total} risultat${data.total === 1 ? "o" : "i"}`;
       $("empty").classList.toggle("hidden", data.total !== 0);
-      $("licenseRows").innerHTML = data.licenses.map((license) => `<tr>
-        <td><strong>••••-${escapeHtml(license.code_suffix)}</strong></td><td>${escapeHtml(license.customer || "—")}</td><td>${escapeHtml(planLabels[license.plan])}</td>
-        <td><span class="badge ${escapeHtml(license.status)}">${escapeHtml(statusLabels[license.status])}</span></td><td>${date(license.created_at)}</td><td>${license.plan === "LIFE" ? "Mai" : date(license.expires_at)}</td>
-        <td title="${escapeHtml(license.instance_id || "")}">${escapeHtml(license.instance_id ? license.instance_id.slice(0, 12) + "…" : "—")}</td>
-        <td><div class="actions">${license.status !== "revoked" ? `<button class="btn danger small" data-action="revoke" data-suffix="${escapeHtml(license.code_suffix)}">Revoca</button>` : ""}${license.status !== "not_activated" ? `<button class="btn secondary small" data-action="release" data-suffix="${escapeHtml(license.code_suffix)}">Rilascia</button>` : ""}</div></td>
-      </tr>`).join("");
+      renderLicenses();
     }
 
     async function refresh() { await Promise.all([loadStats(), loadLicenses()]); }
@@ -195,10 +214,27 @@
     $("filterForm").addEventListener("submit", async (event) => { event.preventDefault(); try { await loadLicenses(); } catch (error) { toast(error.message); } });
     $("licenseRows").addEventListener("click", async (event) => {
       const button = event.target.closest("[data-action]"); if (!button) return;
-      const verb = button.dataset.action === "revoke" ? "revocare" : "rilasciare";
-      if (!confirm(`Vuoi davvero ${verb} la licenza ••••-${button.dataset.suffix}?`)) return;
+      const action = button.dataset.action;
+      const suffix = button.dataset.suffix;
+      if (action === "hide") { revealedCodes.delete(suffix); renderLicenses(); return; }
+      if (action === "copy-code") { await navigator.clipboard.writeText(revealedCodes.get(suffix)); toast("Codice copiato"); return; }
       button.disabled = true;
-      try { await api(`/v1/admin/licenses/${encodeURIComponent(button.dataset.suffix)}/${button.dataset.action}`, { method: "POST" }); toast("Operazione completata"); await refresh(); }
+      try {
+        if (action === "reveal") {
+          const data = await api(`/v1/admin/licenses/${encodeURIComponent(suffix)}/code`);
+          revealedCodes.set(suffix, data.code); renderLicenses(); return;
+        }
+        if (action === "delete") {
+          if (!confirm(`Eliminare definitivamente la licenza ••••-${suffix}? L'operazione non può essere annullata.`)) return;
+          const active = button.dataset.status === "active";
+          if (active && !confirm("ATTENZIONE: la licenza è attiva. Confermi una seconda volta l'eliminazione permanente?")) return;
+          await api(`/v1/admin/licenses/${encodeURIComponent(suffix)}${active ? "?force=true" : ""}`, { method: "DELETE" });
+          revealedCodes.delete(suffix); toast("Licenza eliminata definitivamente"); await refresh(); return;
+        }
+        const verb = action === "revoke" ? "revocare" : "rilasciare";
+        if (!confirm(`Vuoi davvero ${verb} la licenza ••••-${suffix}?`)) return;
+        await api(`/v1/admin/licenses/${encodeURIComponent(suffix)}/${action}`, { method: "POST" }); toast("Operazione completata"); await refresh();
+      }
       catch (error) { toast(error.message); } finally { button.disabled = false; }
     });
     $("refresh").addEventListener("click", async () => { try { await refresh(); toast("Dati aggiornati"); } catch (error) { toast(error.message); } });

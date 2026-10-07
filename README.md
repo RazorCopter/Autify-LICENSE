@@ -27,7 +27,7 @@ Autify cliente (autify-api) -- HTTPS --> licenze.ghome.it
 3. Assegnare il primo a `LICENSE_SHARED_SECRET` e il secondo a `LICENSE_ADMIN_KEY`.
 4. Configurare lo stesso `LICENSE_SHARED_SECRET` negli stack Autify cliente.
 
-`LICENSE_ADMIN_KEY` deve rimanere esclusivamente su questo server e serve per creare o revocare licenze. La dashboard la invia al server solo durante il login e riceve un cookie di sessione `HttpOnly`; la chiave non viene memorizzata nel browser.
+`LICENSE_ADMIN_KEY` deve rimanere esclusivamente su questo server e serve per gestire le licenze. Viene inoltre usata per derivare la chiave AES-256-GCM che protegge i codici licenza archiviati: modificarla rende irrecuperabili i codici gia' memorizzati, pur lasciando invariata la validazione tramite hash. La dashboard la invia al server solo durante il login e riceve un cookie di sessione `HttpOnly`; la chiave non viene memorizzata nel browser.
 
 Le sessioni amministrative durano 8 ore per impostazione predefinita. La durata puo' essere configurata con `LICENSE_ADMIN_SESSION_HOURS` (da 1 a 168 ore). `LICENSE_ADMIN_COOKIE_SECURE` deve restare `true` quando il servizio e' pubblicato in HTTPS; puo' essere impostato a `false` esclusivamente durante test locali in HTTP.
 
@@ -54,10 +54,12 @@ Consente di:
 - consultare i contatori e l'elenco delle licenze;
 - filtrare per azienda, piano e stato;
 - generare licenze da 1, 6 o 12 mesi oppure a vita;
-- copiare i codici appena generati;
-- revocare o rilasciare una licenza.
+- mostrare, nascondere e copiare i codici generati dal server a partire dalla versione 1.2.0;
+- revocare, rilasciare o eliminare definitivamente una licenza.
 
-Il codice completo di una licenza viene conservato soltanto come hash e non puo' essere recuperato successivamente: copiarlo dalla schermata subito dopo la generazione. Nell'elenco viene mostrato esclusivamente il suffisso di sei caratteri.
+I nuovi codici completi sono conservati cifrati con AES-256-GCM e sono recuperabili esclusivamente da un amministratore autenticato. L'hash continua a essere usato per la validazione. Le licenze create prima della versione 1.2.0 conservano soltanto hash e suffisso, quindi il loro codice completo non e' recuperabile. Gli elenchi e i dettagli API non espongono mai il codice: indicano soltanto `code_available`, mentre il recupero avviene tramite un endpoint amministrativo dedicato.
+
+L'eliminazione e' permanente. Per evitare operazioni accidentali, una licenza attiva richiede una seconda conferma nella dashboard e il parametro esplicito `force=true` nell'API.
 
 Le sessioni della dashboard sono conservate in memoria. Un riavvio del container disconnette gli amministratori senza influire sulle licenze. E' comunque raccomandato proteggere `/admin/` con Cloudflare Access, VPN o un controllo equivalente a livello di reverse proxy.
 
@@ -75,6 +77,8 @@ Gli endpoint amministrativi continuano ad accettare l'header `X-License-Admin-Ke
 
 - `GET /health`: health check pubblico.
 - `POST /admin/licenses`: crea una licenza, richiede header `X-License-Admin-Key`.
+- `GET /v1/admin/licenses/{code_suffix}/code`: recupera il codice completo cifrato a riposo, se disponibile.
+- `DELETE /v1/admin/licenses/{code_suffix}`: elimina definitivamente una licenza; richiede `force=true` se attiva.
 - `POST /admin/licenses/revoke`: revoca una licenza, richiede lo stesso header.
 - `POST /activate`: attivazione cifrata da parte di un'istanza Autify.
 - `POST /v1/deactivate`: permette a un'installazione on-premise di rilasciare autonomamente la propria licenza. Il codice torna disponibile per una nuova attivazione.
