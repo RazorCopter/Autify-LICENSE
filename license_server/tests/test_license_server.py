@@ -40,6 +40,12 @@ def test_activation_validation_binding_and_revocation(tmp_path):
 
         reused = client.post("/v1/activate", json=_request_payload(code=code, instance_id="instance-two-12345"))
         assert reused.status_code == 409
+        assert reused.json() == {
+            "detail": (
+                "Licenza già attiva su un'altra installazione. "
+                "Disattivarla dalla precedente installazione prima di procedere."
+            )
+        }
 
         validated = client.post("/v1/validate", json=_request_payload(
             license_token=activation["license_token"], instance_id="instance-one-12345"))
@@ -59,6 +65,80 @@ def test_activation_validation_binding_and_revocation(tmp_path):
         invalid = decrypt_payload(revoked.json(), validate_freshness=False)
         assert invalid["valid"] is False
         assert invalid["reason"] == "revoked"
+
+
+def test_deactivation_authorization_and_reactivation(tmp_path):
+    main.DB_PATH = tmp_path / "deactivation.db"
+    main.limiter.reset()
+    with TestClient(main.app) as client:
+        headers = {"X-License-Admin-Key": os.environ["LICENSE_ADMIN_KEY"]}
+        generated = client.post("/v1/admin/licenses", headers=headers, json={"plan": "12M", "quantity": 1})
+        assert generated.status_code == 200
+        code = generated.json()["codes"][0]
+
+        activated = client.post(
+            "/v1/activate",
+            json=_request_payload(code=code, instance_id="instance-one-12345"),
+        )
+        assert activated.status_code == 200
+        activation = decrypt_payload(activated.json(), validate_freshness=False)
+        token = activation["license_token"]
+
+        unauthorized = client.post(
+            "/v1/deactivate",
+            json=_request_payload(
+                license_token=token,
+                instance_id="instance-two-12345",
+            ),
+        )
+        assert unauthorized.status_code == 200
+        unauthorized_payload = decrypt_payload(unauthorized.json(), validate_freshness=False)
+        assert unauthorized_payload["valid"] is False
+        assert unauthorized_payload["reason"] == "unauthorized"
+
+        deactivated = client.post(
+            "/v1/deactivate",
+            json=_request_payload(
+                license_token=token,
+                instance_id="instance-one-12345",
+            ),
+        )
+        assert deactivated.status_code == 200
+        deactivation = decrypt_payload(deactivated.json(), validate_freshness=False)
+        assert deactivation["valid"] is True
+        assert deactivation["reason"] == "deactivated"
+
+        invalid_token = client.post(
+            "/v1/deactivate",
+            json=_request_payload(
+                license_token=token,
+                instance_id="instance-one-12345",
+            ),
+        )
+        assert invalid_token.status_code == 200
+        invalid_token_payload = decrypt_payload(invalid_token.json(), validate_freshness=False)
+        assert invalid_token_payload["valid"] is False
+        assert invalid_token_payload["reason"] == "unauthorized"
+
+        reactivated = client.post(
+            "/v1/activate",
+            json=_request_payload(code=code, instance_id="instance-two-12345"),
+        )
+        assert reactivated.status_code == 200
+        reactivation = decrypt_payload(reactivated.json(), validate_freshness=False)
+        assert reactivation["valid"] is True
+        assert reactivation["license_token"] != token
+
+        revalidated = client.post(
+            "/v1/validate",
+            json=_request_payload(
+                license_token=reactivation["license_token"],
+                instance_id="instance-two-12345",
+            ),
+        )
+        assert revalidated.status_code == 200
+        revalidation = decrypt_payload(revalidated.json(), validate_freshness=False)
+        assert revalidation["valid"] is True
 
 
 def test_activate_rate_limit_returns_429(tmp_path):

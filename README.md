@@ -77,6 +77,7 @@ Gli endpoint amministrativi continuano ad accettare l'header `X-License-Admin-Ke
 - `POST /admin/licenses`: crea una licenza, richiede header `X-License-Admin-Key`.
 - `POST /admin/licenses/revoke`: revoca una licenza, richiede lo stesso header.
 - `POST /activate`: attivazione cifrata da parte di un'istanza Autify.
+- `POST /v1/deactivate`: permette a un'installazione on-premise di rilasciare autonomamente la propria licenza. Il codice torna disponibile per una nuova attivazione.
 - `POST /validate`: validazione cifrata da parte di un'istanza Autify.
 
 Consultare il codice e i test in `license_server/tests` per i payload amministrativi aggiornati.

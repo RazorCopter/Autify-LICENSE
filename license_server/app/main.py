@@ -79,7 +79,7 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="Autify License Server", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="Autify License Server", version="1.1.0", lifespan=lifespan)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.mount("/admin", StaticFiles(directory=STATIC_PATH, html=True), name="admin")
@@ -429,7 +429,13 @@ def activate(request: Request, envelope: Envelope) -> dict:
         if row["revoked_at"]:
             raise HTTPException(status_code=403, detail="Licenza revocata")
         if row["instance_id"] and row["instance_id"] != instance_id:
-            raise HTTPException(status_code=409, detail="Licenza già associata a un'altra istanza")
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Licenza già attiva su un'altra installazione. "
+                    "Disattivarla dalla precedente installazione prima di procedere."
+                ),
+            )
         opaque_token = secrets.token_urlsafe(32)
         if not row["activated_at"]:
             months = VALID_PLANS[row["plan"]]
@@ -440,12 +446,38 @@ def activate(request: Request, envelope: Envelope) -> dict:
             )
         else:
             connection.execute(
-                "UPDATE licenses SET token_hash = ? WHERE code_hash = ?",
-                (code_hash(opaque_token), code_hash(code)),
+                "UPDATE licenses SET instance_id = ?, token_hash = ? WHERE code_hash = ?",
+                (instance_id, code_hash(opaque_token), code_hash(code)),
             )
         row = connection.execute("SELECT * FROM licenses WHERE code_hash = ?", (code_hash(code),)).fetchone()
         result = public_license(row, now)
         result["license_token"] = opaque_token
+    return encrypt_payload(result)
+
+
+@app.post("/v1/deactivate", response_model=Envelope)
+@limiter.limit(os.getenv("LICENSE_ACTIVATE_RATE_LIMIT", "10/minute"))
+def deactivate(request: Request, envelope: Envelope) -> dict:
+    payload = decrypt_payload(envelope.model_dump())
+    instance_id = str(payload.get("instance_id", ""))
+    token = str(payload.get("license_token", ""))
+    now = datetime.now(timezone.utc)
+    with db() as connection:
+        consume_nonce(connection, payload["request_nonce"], int(payload["timestamp"]))
+        token_digest = code_hash(token)
+        row = connection.execute(
+            "SELECT * FROM licenses WHERE token_hash = ?", (token_digest,)
+        ).fetchone()
+        if row is None or row["instance_id"] != instance_id:
+            result = {"valid": False, "reason": "unauthorized", "server_time": now.isoformat()}
+        else:
+            connection.execute(
+                "UPDATE licenses SET instance_id = NULL, activated_at = NULL, "
+                "expires_at = NULL, token_hash = NULL, revoked_at = NULL "
+                "WHERE token_hash = ?",
+                (token_digest,),
+            )
+            result = {"valid": True, "reason": "deactivated", "server_time": now.isoformat()}
     return encrypt_payload(result)
 
 
